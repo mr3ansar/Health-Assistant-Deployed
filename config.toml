@@ -1,0 +1,18 @@
+[theme]
+base            = "light"
+primaryColor    = "#0f766e"
+backgroundColor = "#f0fdfa"
+secondaryBackgroundColor = "#ecfdf5"
+textColor       = "#1e293b"
+font            = "sans serif"
+
+[server]
+# Prevents Streamlit from opening a browser tab locally (useful in containers)
+headless        = true
+# Required for Streamlit Cloud — do not change
+enableCORS      = false
+enableXsrfProtection = true
+
+[runner]
+# Faster initial load — suppresses magic-command scanning
+magicEnabled    = false
