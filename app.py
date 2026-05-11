@@ -11,13 +11,8 @@ try:
 except ImportError:
     pass
 
-# ── Optional CrewAI import (graceful fallback if not installed) ──────────────
-try:
-    from crewai import Agent, Task, Crew, Process, LLM
-    from crewai_tools import DuckDuckGoSearchTool
-    CREWAI_AVAILABLE = True
-except ImportError:
-    CREWAI_AVAILABLE = False
+# ── Regex for model filtering ────────────────────────────────────────────────
+import re
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -271,11 +266,43 @@ def _read_env_key():
 
 GROQ_API_KEY = _read_env_key()
 
-MODELS = {
-    "🧠 Llama 3.3 70B — Best Quality": "llama-3.3-70b-versatile",
-    "⚡ Llama 3.1 8B — Fastest": "llama-3.1-8b-instant",
-    "🔬 Gemma 2 9B — Efficient": "gemma2-9b-it",
+# Fallback model list (used if live fetch fails)
+FALLBACK_MODELS = {
+    "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
+    "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
+    "gemma2-9b-it": "Gemma 2 9B IT",
 }
+
+# Patterns to EXCLUDE from the model list (non-LLM models)
+_EXCLUDE_PATTERNS = re.compile(
+    r"(whisper|distil|tts|guard|tool-use|specdec|vision|embed|moderation|image|audio)",
+    re.IGNORECASE,
+)
+
+def fetch_groq_models(api_key: str) -> dict:
+    """
+    Fetch live active LLM models from Groq API.
+    Returns {model_id: display_name} sorted alphabetically.
+    Falls back to FALLBACK_MODELS on any error.
+    """
+    try:
+        _client = Groq(api_key=api_key)
+        response = _client.models.list()
+        models = {}
+        for m in response.data:
+            mid = m.id
+            # Skip non-LLM models
+            if _EXCLUDE_PATTERNS.search(mid):
+                continue
+            # Build a friendly display name from the model id
+            display = mid.replace("-", " ").replace("_", " ").title()
+            models[mid] = display
+        if not models:
+            return FALLBACK_MODELS.copy()
+        # Sort alphabetically by display name
+        return dict(sorted(models.items(), key=lambda x: x[1]))
+    except Exception:
+        return FALLBACK_MODELS.copy()
 
 TOKEN_MODES = {
     "⚡ Ultra Saver — ~80 tokens": {
@@ -408,92 +435,14 @@ def is_health_related(message: str, model_id: str) -> bool:
     except Exception:
         return True  # fail open — let the system prompt handle edge cases
 
-# ── CrewAI multi-agent workflow ───────────────────────────────────────────────
-def run_health_crew(model_id: str, query: str, max_tokens: int, api_key: str) -> str:
-    """
-    Two-agent pipeline:
-      1. Medical Web Researcher  — searches DuckDuckGo for current health facts
-      2. Health Communicator     — synthesises research into a concise, warm reply
-    """
-    llm = LLM(
-        model=f"groq/{model_id}",
-        api_key=api_key,
-        temperature=0.7,
-        max_tokens=max_tokens,
-    )
 
-    search_tool = DuckDuckGoSearchTool()
-
-    # ── Agent 1 ──
-    researcher = Agent(
-        role="Medical Web Researcher",
-        goal="Find 2-3 key, accurate health facts from trusted sources for the given health query.",
-        backstory=(
-            "You are a specialist medical researcher who retrieves health information "
-            "exclusively from authoritative sources: WHO, NIH, Mayo Clinic, WebMD, CDC. "
-            "You only research health and medical topics and clearly note the source."
-        ),
-        tools=[search_tool],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False,
-        max_iter=3,
-    )
-
-    # ── Agent 2 ──
-    communicator = Agent(
-        role="Health Communication Specialist",
-        goal=(
-            "Turn the researcher's findings into a clear, warm, empathetic health "
-            "response of exactly 3-4 sentences."
-        ),
-        backstory=(
-            "You are a compassionate health educator who explains medical information "
-            "in plain language. You always remind users to consult a real doctor for "
-            "personal advice, and you NEVER diagnose or prescribe."
-        ),
-        llm=llm,
-        verbose=False,
-        allow_delegation=False,
-    )
-
-    # ── Task 1 ──
-    research_task = Task(
-        description=(
-            f"Search the web for reliable, up-to-date health information about: '{query}'. "
-            "Retrieve 2-3 specific facts with source names. Health topics only."
-        ),
-        agent=researcher,
-        expected_output="2-3 bullet-point facts about the health topic with source names.",
-    )
-
-    # ── Task 2 ──
-    synthesis_task = Task(
-        description=(
-            f"Using only the research provided, write a 3-4 sentence health response to: '{query}'. "
-            "Tone: warm, clear, empathetic. End with a reminder to see a healthcare professional. "
-            "Do NOT diagnose or prescribe."
-        ),
-        agent=communicator,
-        expected_output="A concise, empathetic 3-4 sentence health response.",
-        context=[research_task],
-    )
-
-    crew = Crew(
-        agents=[researcher, communicator],
-        tasks=[research_task, synthesis_task],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    result = crew.kickoff()
-    return str(result).strip()
 
 # ── Session state init ────────────────────────────────────────────────────────
 for key, default in {
     "messages": [],
     "feedback_given": {},
     "pending_rating": None,   # (msg_index, rating)
+    "groq_models": None,      # cached live model list
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -570,15 +519,36 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Model selection ──────────────────────────────────────
+    # ── Model selection (dynamic from Groq API) ──────────────
     st.markdown("### 🤖 AI Model")
-    model_name = st.selectbox(
+    # Resolve the key early so we can fetch models
+    _key_for_fetch = (
+        sidebar_key.strip() if sidebar_key and sidebar_key.strip()
+        else GROQ_API_KEY
+    )
+    if _key_for_fetch:
+        if st.session_state.groq_models is None:
+            with st.spinner("Fetching live models…"):
+                st.session_state.groq_models = fetch_groq_models(_key_for_fetch)
+        live_models = st.session_state.groq_models
+    else:
+        live_models = FALLBACK_MODELS.copy()
+
+    # Build selectbox: display_name → model_id
+    model_options = {v: k for k, v in live_models.items()}  # display → id
+    display_names = list(model_options.keys())
+    selected_display = st.selectbox(
         "model",
-        list(MODELS.keys()),
+        display_names,
         index=0,
         label_visibility="collapsed",
     )
-    selected_model = MODELS[model_name]
+    selected_model = model_options[selected_display]
+    st.caption(f"`{selected_model}`")
+
+    if st.button("🔄 Refresh Models", use_container_width=True, key="refresh_models"):
+        st.session_state.groq_models = None
+        st.rerun()
 
     st.divider()
 
@@ -598,24 +568,9 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Web search agents ────────────────────────────────────
-    st.markdown("### 🌐 CrewAI Web Agents")
-    if not CREWAI_AVAILABLE:
-        st.warning(
-            "CrewAI not installed.\n"
-            "Run: `pip install crewai crewai-tools`"
-        )
-        use_web = False
-    else:
-        use_web = st.toggle(
-            "Enable web search agents",
-            value=False,
-            help="Researcher → Communicator pipeline. Slower but uses live web data.",
-        )
-        if use_web:
-            st.success("🟢 2-Agent pipeline active\n\n🔍 Researcher  →  💬 Communicator")
-        else:
-            st.info("💨 Direct mode — faster responses")
+    # ── Mode info ─────────────────────────────────────────────
+    st.markdown("### ⚡ Mode")
+    st.info("💨 Direct LLM — fast, focused responses")
 
     st.divider()
 
@@ -686,19 +641,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if use_web:
-    st.markdown(
-        """
-        <div class="pipeline-row">
-            <span class="agent-pill">🔍 Web Researcher</span>
-            <span class="arrow">→</span>
-            <span class="agent-pill">💬 Health Communicator</span>
-            <span class="arrow">→</span>
-            <span class="agent-pill">✅ Verified Response</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+
 
 st.divider()
 
@@ -762,38 +705,6 @@ if prompt := st.chat_input("Ask a health or wellness question…"):
                 "Please use the appropriate resource for other topics."
             )
             st.markdown(reply)
-
-        elif use_web and CREWAI_AVAILABLE:
-            # Multi-agent path
-            placeholder = st.empty()
-            placeholder.info(
-                "🤖 **Agent pipeline running…**  \n"
-                "🔍 Researcher searching live medical sources  →  "
-                "💬 Communicator preparing your response"
-            )
-            try:
-                reply = run_health_crew(selected_model, prompt, tok["max_tokens"], ACTIVE_KEY)
-                placeholder.empty()
-                st.markdown(reply)
-            except Exception as crew_err:
-                placeholder.empty()
-                st.warning(
-                    f"⚠️ Agent pipeline error — falling back to direct mode.  \n"
-                    f"_(Reason: {crew_err})_"
-                )
-                # Fallback: direct Groq call
-                system_prompt = BASE_SYSTEM_PROMPT + get_feedback_context()
-                fallback = client.chat.completions.create(
-                    model=selected_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        *st.session_state.messages,
-                    ],
-                    temperature=tok["temperature"],
-                    max_tokens=tok["max_tokens"],
-                )
-                reply = fallback.choices[0].message.content.strip()
-                st.markdown(reply)
 
         else:
             # Direct Groq path
