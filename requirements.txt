@@ -10,5 +10,6 @@ python-dotenv>=1.0.0
 
 # CrewAI multi-agent web search (optional — app degrades gracefully if absent)
 crewai>=0.80.0
+pydantic
 crewai-tools>=0.17.0
 duckduckgo-search>=6.1.0
